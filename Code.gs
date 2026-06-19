@@ -1,406 +1,386 @@
 /**
- * ============================================================
- *  BUMDES FINANCE - BATUATAS LIWU
- *  Backend Google Apps Script (Spreadsheet sebagai Database)
- * ============================================================
- *
- *  Fitur:
- *   - Login user/password (token-based, hash SHA-256 + salt)
- *   - Multi unit usaha BUMDes
- *   - Catat pemasukan & pengeluaran
- *   - Saldo kas berjalan otomatis
- *   - Laporan & data untuk grafik (laba rugi, kas)
- *   - Manajemen pengguna (khusus admin)
- *
- *  Cara pakai singkat:
- *   1. Buat Spreadsheet baru, salin ID-nya ke SPREADSHEET_ID di bawah
- *      (atau biarkan kosong jika script ini terikat / bound ke Spreadsheet).
- *   2. Jalankan fungsi setupDatabase() sekali dari editor untuk membuat
- *      semua sheet + akun admin default.
- *   3. Deploy > New deployment > Web app.
- * ============================================================
+ * BUMDes Finance Batuatas Liwu
+ * Backend Google Apps Script + Google Sheets.
  */
 
-// Jika script TIDAK terikat ke spreadsheet, isi ID spreadsheet di sini.
-// Jika dibiarkan kosong dan script bound ke spreadsheet, otomatis pakai aktif.
-const SPREADSHEET_ID = '';
-
-const APP_NAME = 'BUMDes Finance — Batuatas Liwu';
-const SALT = 'BumdesBatuatasLiwu#2024'; // ganti dengan string rahasia Anda sendiri
-const SESSION_HOURS = 8;
-
-const SHEETS = {
-  USERS: 'Users',
-  UNITS: 'Units',
-  TRX: 'Transaksi',
-  KATEGORI: 'Kategori'
+const APP = {
+  name: 'BUMDes Finance Batuatas Liwu',
+  propertyKey: 'BUMDES_SPREADSHEET_ID',
+  sheets: {
+    settings: ['key', 'value'],
+    units: ['id', 'name', 'category', 'manager', 'status'],
+    accounts: ['code', 'name', 'type', 'openingBalance'],
+    transactions: [
+      'id', 'date', 'reference', 'type', 'category', 'account', 'unit',
+      'description', 'amount', 'paymentMethod', 'evidenceUrl', 'status',
+      'createdBy', 'createdAt', 'updatedAt'
+    ],
+    budgets: ['id', 'year', 'category', 'unit', 'amount', 'note'],
+    audit: ['timestamp', 'action', 'entity', 'entityId', 'user', 'detail']
+  }
 };
 
-/* ----------------------- Util Spreadsheet ----------------------- */
-function _ss() {
-  if (SPREADSHEET_ID && SPREADSHEET_ID.trim() !== '') {
-    return SpreadsheetApp.openById(SPREADSHEET_ID);
-  }
-  const active = SpreadsheetApp.getActiveSpreadsheet();
-  if (!active) {
-    throw new Error('SPREADSHEET_ID belum diisi dan script tidak terikat ke Spreadsheet.');
-  }
-  return active;
-}
-
-function _sheet(name) {
-  const ss = _ss();
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  return sh;
-}
-
-function _rows(name) {
-  const sh = _sheet(name);
-  const values = sh.getDataRange().getValues();
-  if (values.length < 2) return { header: values[0] || [], data: [] };
-  const header = values[0];
-  const data = values.slice(1).map(function (r) {
-    const o = {};
-    header.forEach(function (h, i) { o[h] = r[i]; });
-    return o;
-  });
-  return { header: header, data: data };
-}
-
-/* ----------------------- Setup / Seeding ----------------------- */
-function setupDatabase() {
-  const ss = _ss();
-
-  // Users
-  const users = _sheet(SHEETS.USERS);
-  if (users.getLastRow() === 0) {
-    users.appendRow(['Username', 'PasswordHash', 'Nama', 'Role', 'Aktif', 'DibuatPada']);
-    users.appendRow(['admin', _hash('admin123'), 'Administrator', 'admin', true, new Date()]);
-  }
-
-  // Units
-  const units = _sheet(SHEETS.UNITS);
-  if (units.getLastRow() === 0) {
-    units.appendRow(['KodeUnit', 'NamaUnit', 'Keterangan', 'Aktif', 'DibuatPada']);
-    units.appendRow(['U001', 'Unit Simpan Pinjam', 'Layanan keuangan mikro desa', true, new Date()]);
-    units.appendRow(['U002', 'Unit Sembako', 'Toko kebutuhan pokok', true, new Date()]);
-    units.appendRow(['U003', 'Unit Air Bersih', 'Pengelolaan air bersih desa', true, new Date()]);
-  }
-
-  // Kategori
-  const kat = _sheet(SHEETS.KATEGORI);
-  if (kat.getLastRow() === 0) {
-    kat.appendRow(['Kategori', 'Jenis', 'Aktif']);
-    [['Penjualan', 'Pemasukan'], ['Iuran/Jasa', 'Pemasukan'], ['Modal/Penyertaan', 'Pemasukan'],
-     ['Pendapatan Lain', 'Pemasukan'], ['Pembelian Barang', 'Pengeluaran'], ['Gaji/Honor', 'Pengeluaran'],
-     ['Operasional', 'Pengeluaran'], ['Listrik/Air', 'Pengeluaran'], ['Pengeluaran Lain', 'Pengeluaran']]
-      .forEach(function (r) { kat.appendRow([r[0], r[1], true]); });
-  }
-
-  // Transaksi
-  const trx = _sheet(SHEETS.TRX);
-  if (trx.getLastRow() === 0) {
-    trx.appendRow(['ID', 'Tanggal', 'KodeUnit', 'Jenis', 'Kategori', 'Keterangan', 'Jumlah', 'Operator', 'DibuatPada']);
-  }
-
-  return 'Setup selesai. Login: admin / admin123 (segera ganti password).';
-}
-
-/* ----------------------- Keamanan ----------------------- */
-function _hash(text) {
-  const raw = Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, text + SALT, Utilities.Charset.UTF_8);
-  return raw.map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('');
-}
-
-function _newToken(user) {
-  const token = Utilities.getUuid();
-  const cache = CacheService.getScriptCache();
-  cache.put('tok_' + token, JSON.stringify({ u: user.Username, r: user.Role, n: user.Nama }), SESSION_HOURS * 3600);
-  return token;
-}
-
-function _auth(token) {
-  if (!token) throw new Error('Sesi tidak valid. Silakan login ulang.');
-  const cache = CacheService.getScriptCache();
-  const raw = cache.get('tok_' + token);
-  if (!raw) throw new Error('Sesi berakhir. Silakan login ulang.');
-  return JSON.parse(raw);
-}
-
-function _requireAdmin(token) {
-  const s = _auth(token);
-  if (s.r !== 'admin') throw new Error('Akses ditolak. Hanya admin.');
-  return s;
-}
-
-/* ----------------------- API: Auth ----------------------- */
-function login(username, password) {
-  const rows = _rows(SHEETS.USERS).data;
-  const u = rows.filter(function (x) {
-    return String(x.Username).toLowerCase() === String(username).toLowerCase();
-  })[0];
-  if (!u) return { ok: false, message: 'Username tidak ditemukan.' };
-  if (u.Aktif === false) return { ok: false, message: 'Akun nonaktif.' };
-  if (String(u.PasswordHash) !== _hash(password)) return { ok: false, message: 'Password salah.' };
-  const token = _newToken(u);
-  return { ok: true, token: token, user: { username: u.Username, nama: u.Nama, role: u.Role }, appName: APP_NAME };
-}
-
-function logout(token) {
-  if (token) CacheService.getScriptCache().remove('tok_' + token);
-  return { ok: true };
-}
-
-function changePassword(token, oldPass, newPass) {
-  const s = _auth(token);
-  const sh = _sheet(SHEETS.USERS);
-  const values = sh.getDataRange().getValues();
-  for (var i = 1; i < values.length; i++) {
-    if (String(values[i][0]).toLowerCase() === s.u.toLowerCase()) {
-      if (String(values[i][1]) !== _hash(oldPass)) return { ok: false, message: 'Password lama salah.' };
-      sh.getRange(i + 1, 2).setValue(_hash(newPass));
-      return { ok: true, message: 'Password berhasil diubah.' };
-    }
-  }
-  return { ok: false, message: 'User tidak ditemukan.' };
-}
-
-/* ----------------------- API: Master data ----------------------- */
-function getBootstrap(token) {
-  _auth(token);
-  return {
-    units: _rows(SHEETS.UNITS).data,
-    kategori: _rows(SHEETS.KATEGORI).data
-  };
-}
-
-function listUnits(token) {
-  _auth(token);
-  return _rows(SHEETS.UNITS).data;
-}
-
-function saveUnit(token, unit) {
-  _requireAdmin(token);
-  const sh = _sheet(SHEETS.UNITS);
-  const values = sh.getDataRange().getValues();
-  if (unit.KodeUnit) {
-    for (var i = 1; i < values.length; i++) {
-      if (String(values[i][0]) === String(unit.KodeUnit)) {
-        sh.getRange(i + 1, 2).setValue(unit.NamaUnit);
-        sh.getRange(i + 1, 3).setValue(unit.Keterangan || '');
-        sh.getRange(i + 1, 4).setValue(unit.Aktif !== false);
-        return { ok: true, message: 'Unit diperbarui.' };
-      }
-    }
-  }
-  const kode = 'U' + ('000' + (values.length)).slice(-3);
-  sh.appendRow([kode, unit.NamaUnit, unit.Keterangan || '', true, new Date()]);
-  return { ok: true, message: 'Unit ditambahkan.', kode: kode };
-}
-
-function deleteUnit(token, kodeUnit) {
-  _requireAdmin(token);
-  const sh = _sheet(SHEETS.UNITS);
-  const values = sh.getDataRange().getValues();
-  for (var i = 1; i < values.length; i++) {
-    if (String(values[i][0]) === String(kodeUnit)) {
-      sh.deleteRow(i + 1);
-      return { ok: true, message: 'Unit dihapus.' };
-    }
-  }
-  return { ok: false, message: 'Unit tidak ditemukan.' };
-}
-
-/* ----------------------- API: Transaksi ----------------------- */
-function listTransaksi(token, filter) {
-  _auth(token);
-  filter = filter || {};
-  var data = _rows(SHEETS.TRX).data.map(function (r) {
-    return {
-      ID: r.ID,
-      Tanggal: _dateStr(r.Tanggal),
-      KodeUnit: r.KodeUnit,
-      Jenis: r.Jenis,
-      Kategori: r.Kategori,
-      Keterangan: r.Keterangan,
-      Jumlah: Number(r.Jumlah) || 0,
-      Operator: r.Operator
-    };
-  });
-  if (filter.unit) data = data.filter(function (r) { return r.KodeUnit === filter.unit; });
-  if (filter.jenis) data = data.filter(function (r) { return r.Jenis === filter.jenis; });
-  if (filter.dari) data = data.filter(function (r) { return r.Tanggal >= filter.dari; });
-  if (filter.sampai) data = data.filter(function (r) { return r.Tanggal <= filter.sampai; });
-  data.sort(function (a, b) { return a.Tanggal < b.Tanggal ? 1 : -1; });
-  return data;
-}
-
-function saveTransaksi(token, trx) {
-  const s = _auth(token);
-  const sh = _sheet(SHEETS.TRX);
-  const jumlah = Number(trx.Jumlah) || 0;
-  if (jumlah <= 0) return { ok: false, message: 'Jumlah harus lebih dari 0.' };
-  if (!trx.Tanggal) return { ok: false, message: 'Tanggal wajib diisi.' };
-  if (!trx.KodeUnit) return { ok: false, message: 'Unit usaha wajib dipilih.' };
-
-  if (trx.ID) {
-    const values = sh.getDataRange().getValues();
-    for (var i = 1; i < values.length; i++) {
-      if (String(values[i][0]) === String(trx.ID)) {
-        sh.getRange(i + 1, 2, 1, 7).setValues([[trx.Tanggal, trx.KodeUnit, trx.Jenis, trx.Kategori || '', trx.Keterangan || '', jumlah, s.u]]);
-        return { ok: true, message: 'Transaksi diperbarui.' };
-      }
-    }
-    return { ok: false, message: 'Transaksi tidak ditemukan.' };
-  }
-  const id = 'TRX' + Date.now();
-  sh.appendRow([id, trx.Tanggal, trx.KodeUnit, trx.Jenis, trx.Kategori || '', trx.Keterangan || '', jumlah, s.u, new Date()]);
-  return { ok: true, message: 'Transaksi disimpan.', id: id };
-}
-
-function deleteTransaksi(token, id) {
-  _auth(token);
-  const sh = _sheet(SHEETS.TRX);
-  const values = sh.getDataRange().getValues();
-  for (var i = 1; i < values.length; i++) {
-    if (String(values[i][0]) === String(id)) {
-      sh.deleteRow(i + 1);
-      return { ok: true, message: 'Transaksi dihapus.' };
-    }
-  }
-  return { ok: false, message: 'Transaksi tidak ditemukan.' };
-}
-
-/* ----------------------- API: Dashboard / Laporan ----------------------- */
-function getDashboard(token, filter) {
-  _auth(token);
-  const trx = listTransaksi(token, filter);
-  const units = {};
-  _rows(SHEETS.UNITS).data.forEach(function (u) { units[u.KodeUnit] = u.NamaUnit; });
-
-  var totalIn = 0, totalOut = 0;
-  const perBulan = {};   // 'YYYY-MM' -> {in, out}
-  const perUnit = {};    // kode -> {in, out}
-  const perKategori = {};// kategori -> jumlah (pengeluaran)
-
-  trx.forEach(function (r) {
-    const isIn = r.Jenis === 'Pemasukan';
-    if (isIn) totalIn += r.Jumlah; else totalOut += r.Jumlah;
-
-    const ym = (r.Tanggal || '').substring(0, 7);
-    if (!perBulan[ym]) perBulan[ym] = { in: 0, out: 0 };
-    perBulan[ym][isIn ? 'in' : 'out'] += r.Jumlah;
-
-    if (!perUnit[r.KodeUnit]) perUnit[r.KodeUnit] = { in: 0, out: 0 };
-    perUnit[r.KodeUnit][isIn ? 'in' : 'out'] += r.Jumlah;
-
-    if (!isIn) {
-      const k = r.Kategori || 'Lainnya';
-      perKategori[k] = (perKategori[k] || 0) + r.Jumlah;
-    }
-  });
-
-  const bulanKeys = Object.keys(perBulan).sort();
-  const unitKeys = Object.keys(perUnit);
-
-  return {
-    totalIn: totalIn,
-    totalOut: totalOut,
-    saldo: totalIn - totalOut,
-    jumlahTransaksi: trx.length,
-    timeseries: {
-      labels: bulanKeys,
-      pemasukan: bulanKeys.map(function (k) { return perBulan[k].in; }),
-      pengeluaran: bulanKeys.map(function (k) { return perBulan[k].out; })
-    },
-    perUnit: {
-      labels: unitKeys.map(function (k) { return units[k] || k; }),
-      laba: unitKeys.map(function (k) { return perUnit[k].in - perUnit[k].out; }),
-      pemasukan: unitKeys.map(function (k) { return perUnit[k].in; }),
-      pengeluaran: unitKeys.map(function (k) { return perUnit[k].out; })
-    },
-    perKategori: {
-      labels: Object.keys(perKategori),
-      data: Object.keys(perKategori).map(function (k) { return perKategori[k]; })
-    }
-  };
-}
-
-/* Laporan dengan saldo berjalan (urut tanggal naik) */
-function getLaporan(token, filter) {
-  _auth(token);
-  const units = {};
-  _rows(SHEETS.UNITS).data.forEach(function (u) { units[u.KodeUnit] = u.NamaUnit; });
-  var data = listTransaksi(token, filter);
-  data.sort(function (a, b) { return a.Tanggal > b.Tanggal ? 1 : (a.Tanggal < b.Tanggal ? -1 : 0); });
-  var saldo = 0;
-  const rows = data.map(function (r) {
-    saldo += (r.Jenis === 'Pemasukan' ? r.Jumlah : -r.Jumlah);
-    return {
-      Tanggal: r.Tanggal, Unit: units[r.KodeUnit] || r.KodeUnit, Jenis: r.Jenis,
-      Kategori: r.Kategori, Keterangan: r.Keterangan,
-      Masuk: r.Jenis === 'Pemasukan' ? r.Jumlah : 0,
-      Keluar: r.Jenis === 'Pengeluaran' ? r.Jumlah : 0,
-      Saldo: saldo
-    };
-  });
-  return { appName: APP_NAME, rows: rows, saldoAkhir: saldo };
-}
-
-/* ----------------------- API: Users (admin) ----------------------- */
-function listUsers(token) {
-  _requireAdmin(token);
-  return _rows(SHEETS.USERS).data.map(function (u) {
-    return { Username: u.Username, Nama: u.Nama, Role: u.Role, Aktif: u.Aktif !== false };
-  });
-}
-
-function saveUser(token, user) {
-  _requireAdmin(token);
-  const sh = _sheet(SHEETS.USERS);
-  const values = sh.getDataRange().getValues();
-  for (var i = 1; i < values.length; i++) {
-    if (String(values[i][0]).toLowerCase() === String(user.Username).toLowerCase()) {
-      sh.getRange(i + 1, 3).setValue(user.Nama);
-      sh.getRange(i + 1, 4).setValue(user.Role);
-      sh.getRange(i + 1, 5).setValue(user.Aktif !== false);
-      if (user.Password) sh.getRange(i + 1, 2).setValue(_hash(user.Password));
-      return { ok: true, message: 'Pengguna diperbarui.' };
-    }
-  }
-  if (!user.Password) return { ok: false, message: 'Password wajib untuk pengguna baru.' };
-  sh.appendRow([user.Username, _hash(user.Password), user.Nama, user.Role || 'operator', true, new Date()]);
-  return { ok: true, message: 'Pengguna ditambahkan.' };
-}
-
-function deleteUser(token, username) {
-  const s = _requireAdmin(token);
-  if (s.u.toLowerCase() === String(username).toLowerCase()) return { ok: false, message: 'Tidak bisa menghapus akun sendiri.' };
-  const sh = _sheet(SHEETS.USERS);
-  const values = sh.getDataRange().getValues();
-  for (var i = 1; i < values.length; i++) {
-    if (String(values[i][0]).toLowerCase() === String(username).toLowerCase()) {
-      sh.deleteRow(i + 1);
-      return { ok: true, message: 'Pengguna dihapus.' };
-    }
-  }
-  return { ok: false, message: 'Pengguna tidak ditemukan.' };
-}
-
-/* ----------------------- Helpers ----------------------- */
-function _dateStr(d) {
-  if (!d) return '';
-  if (Object.prototype.toString.call(d) === '[object Date]') {
-    return Utilities.formatDate(d, Session.getScriptTimeZone(), 'yyyy-MM-dd');
-  }
-  return String(d).substring(0, 10);
-}
-
-/* ----------------------- Web App ----------------------- */
 function doGet() {
-  return HtmlService.createHtmlOutputFromFile('Index')
-    .setTitle(APP_NAME)
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle(APP.name)
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover');
+}
+
+/** Run once from the Apps Script editor, or let the app initialize on first load. */
+function setupBumdesApp() {
+  const spreadsheet = getSpreadsheet_();
+  ensureSchema_(spreadsheet);
+  seedData_(spreadsheet);
+  return {
+    success: true,
+    spreadsheetId: spreadsheet.getId(),
+    spreadsheetUrl: spreadsheet.getUrl(),
+    message: 'Database BUMDes Finance siap digunakan.'
+  };
+}
+
+function getBootstrapData() {
+  const spreadsheet = getSpreadsheet_();
+  ensureSchema_(spreadsheet);
+  seedData_(spreadsheet);
+
+  const settings = rowsAsObjects_(spreadsheet.getSheetByName('settings'))
+    .reduce(function (acc, row) {
+      acc[row.key] = row.value;
+      return acc;
+    }, {});
+
+  return {
+    success: true,
+    settings: settings,
+    units: rowsAsObjects_(spreadsheet.getSheetByName('units')),
+    accounts: rowsAsObjects_(spreadsheet.getSheetByName('accounts')),
+    transactions: rowsAsObjects_(spreadsheet.getSheetByName('transactions')),
+    budgets: rowsAsObjects_(spreadsheet.getSheetByName('budgets')),
+    meta: {
+      spreadsheetUrl: spreadsheet.getUrl(),
+      currentUser: getUserEmail_(),
+      generatedAt: new Date().toISOString()
+    }
+  };
+}
+
+function saveTransaction(payload) {
+  payload = payload || {};
+  validateTransaction_(payload);
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getSpreadsheet_();
+    const sheet = spreadsheet.getSheetByName('transactions');
+    const headers = APP.sheets.transactions;
+    const rows = rowsAsObjects_(sheet);
+    const now = new Date().toISOString();
+    const user = getUserEmail_();
+    const id = cleanText_(payload.id) || makeId_('TRX');
+    const existingIndex = rows.findIndex(function (item) { return item.id === id; });
+    const existing = existingIndex >= 0 ? rows[existingIndex] : {};
+
+    const record = {
+      id: id,
+      date: normalizeDate_(payload.date),
+      reference: cleanText_(payload.reference) || nextReference_(sheet, payload.type),
+      type: cleanText_(payload.type),
+      category: cleanText_(payload.category),
+      account: cleanText_(payload.account),
+      unit: cleanText_(payload.unit),
+      description: cleanText_(payload.description),
+      amount: Number(payload.amount),
+      paymentMethod: cleanText_(payload.paymentMethod),
+      evidenceUrl: cleanText_(payload.evidenceUrl),
+      status: cleanText_(payload.status) || 'Posted',
+      createdBy: existing.createdBy || user,
+      createdAt: existing.createdAt || now,
+      updatedAt: now
+    };
+
+    const values = headers.map(function (key) { return record[key]; });
+    if (existingIndex >= 0) {
+      sheet.getRange(existingIndex + 2, 1, 1, headers.length).setValues([values]);
+    } else {
+      sheet.appendRow(values);
+    }
+
+    appendAudit_(spreadsheet, existingIndex >= 0 ? 'UPDATE' : 'CREATE', 'transaction', id, JSON.stringify({
+      reference: record.reference,
+      amount: record.amount,
+      type: record.type
+    }));
+
+    return { success: true, transaction: record, message: 'Transaksi berhasil disimpan.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function voidTransaction(id, reason) {
+  id = cleanText_(id);
+  if (!id) throw new Error('ID transaksi tidak valid.');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getSpreadsheet_();
+    const sheet = spreadsheet.getSheetByName('transactions');
+    const rows = rowsAsObjects_(sheet);
+    const index = rows.findIndex(function (item) { return item.id === id; });
+    if (index < 0) throw new Error('Transaksi tidak ditemukan.');
+
+    const statusColumn = APP.sheets.transactions.indexOf('status') + 1;
+    const updatedColumn = APP.sheets.transactions.indexOf('updatedAt') + 1;
+    sheet.getRange(index + 2, statusColumn).setValue('Void');
+    sheet.getRange(index + 2, updatedColumn).setValue(new Date().toISOString());
+    appendAudit_(spreadsheet, 'VOID', 'transaction', id, cleanText_(reason) || 'Dibatalkan oleh operator');
+    return { success: true, message: 'Transaksi telah dibatalkan.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function saveBudget(payload) {
+  payload = payload || {};
+  const year = Number(payload.year);
+  const amount = Number(payload.amount);
+  if (!year || year < 2020 || year > 2100) throw new Error('Tahun anggaran tidak valid.');
+  if (!cleanText_(payload.category)) throw new Error('Kategori anggaran wajib dipilih.');
+  if (!cleanText_(payload.unit)) throw new Error('Unit usaha wajib dipilih.');
+  if (!Number.isFinite(amount) || amount <= 0) throw new Error('Nilai anggaran harus lebih dari nol.');
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    const spreadsheet = getSpreadsheet_();
+    const sheet = spreadsheet.getSheetByName('budgets');
+    const rows = rowsAsObjects_(sheet);
+    const id = cleanText_(payload.id) || makeId_('BDG');
+    const existingIndex = rows.findIndex(function (item) { return item.id === id; });
+    const record = {
+      id: id,
+      year: year,
+      category: cleanText_(payload.category),
+      unit: cleanText_(payload.unit),
+      amount: amount,
+      note: cleanText_(payload.note)
+    };
+    const values = APP.sheets.budgets.map(function (key) { return record[key]; });
+    if (existingIndex >= 0) {
+      sheet.getRange(existingIndex + 2, 1, 1, values.length).setValues([values]);
+    } else {
+      sheet.appendRow(values);
+    }
+    appendAudit_(spreadsheet, existingIndex >= 0 ? 'UPDATE' : 'CREATE', 'budget', id, JSON.stringify(record));
+    return { success: true, budget: record, message: 'Anggaran berhasil disimpan.' };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function saveSettings(payload) {
+  payload = payload || {};
+  const allowed = ['organizationName', 'villageName', 'districtName', 'regencyName', 'treasurerName', 'currency'];
+  const spreadsheet = getSpreadsheet_();
+  const sheet = spreadsheet.getSheetByName('settings');
+  const rows = rowsAsObjects_(sheet);
+
+  allowed.forEach(function (key) {
+    if (typeof payload[key] === 'undefined') return;
+    const value = cleanText_(payload[key]);
+    const index = rows.findIndex(function (row) { return row.key === key; });
+    if (index >= 0) sheet.getRange(index + 2, 2).setValue(value);
+    else sheet.appendRow([key, value]);
+  });
+
+  appendAudit_(spreadsheet, 'UPDATE', 'settings', 'organization', 'Profil organisasi diperbarui');
+  return { success: true, message: 'Pengaturan berhasil diperbarui.' };
+}
+
+function getSpreadsheet_() {
+  const properties = PropertiesService.getScriptProperties();
+  const id = properties.getProperty(APP.propertyKey);
+  if (id) {
+    try {
+      return SpreadsheetApp.openById(id);
+    } catch (error) {
+      properties.deleteProperty(APP.propertyKey);
+    }
+  }
+
+  const spreadsheet = SpreadsheetApp.create('Database - ' + APP.name);
+  properties.setProperty(APP.propertyKey, spreadsheet.getId());
+  return spreadsheet;
+}
+
+function ensureSchema_(spreadsheet) {
+  Object.keys(APP.sheets).forEach(function (name) {
+    let sheet = spreadsheet.getSheetByName(name);
+    if (!sheet) sheet = spreadsheet.insertSheet(name);
+    const headers = APP.sheets[name];
+    const current = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+    if (current.join('|') !== headers.join('|')) {
+      sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    }
+    sheet.setFrozenRows(1);
+    sheet.getRange(1, 1, 1, headers.length)
+      .setBackground('#123B5D')
+      .setFontColor('#FFFFFF')
+      .setFontWeight('bold');
+  });
+
+  const defaultSheet = spreadsheet.getSheetByName('Sheet1');
+  if (defaultSheet && spreadsheet.getSheets().length > Object.keys(APP.sheets).length) {
+    spreadsheet.deleteSheet(defaultSheet);
+  }
+}
+
+function seedData_(spreadsheet) {
+  const settingsSheet = spreadsheet.getSheetByName('settings');
+  if (settingsSheet.getLastRow() <= 1) {
+    settingsSheet.getRange(2, 1, 6, 2).setValues([
+      ['organizationName', 'BUMDes Batuatas Liwu'],
+      ['villageName', 'Desa Batuatas Liwu'],
+      ['districtName', 'Kecamatan Batu Atas'],
+      ['regencyName', 'Kabupaten Buton Selatan'],
+      ['treasurerName', 'Bendahara BUMDes'],
+      ['currency', 'IDR']
+    ]);
+  }
+
+  const unitsSheet = spreadsheet.getSheetByName('units');
+  if (unitsSheet.getLastRow() <= 1) {
+    unitsSheet.getRange(2, 1, 4, 5).setValues([
+      ['UNT-001', 'Perdagangan Desa', 'Perdagangan', 'La Ode Rahman', 'Aktif'],
+      ['UNT-002', 'Air Bersih', 'Layanan', 'Wa Ode Nur', 'Aktif'],
+      ['UNT-003', 'Sewa Peralatan', 'Penyewaan', 'La Ode Amir', 'Aktif'],
+      ['UNT-004', 'Wisata Bahari', 'Pariwisata', 'Wa Ode Mina', 'Aktif']
+    ]);
+  }
+
+  const accountsSheet = spreadsheet.getSheetByName('accounts');
+  if (accountsSheet.getLastRow() <= 1) {
+    accountsSheet.getRange(2, 1, 4, 4).setValues([
+      ['1101', 'Kas Tunai', 'Kas', 5000000],
+      ['1102', 'Bank BRI', 'Bank', 15000000],
+      ['1103', 'Bank Sultra', 'Bank', 10000000],
+      ['1201', 'Piutang Usaha', 'Piutang', 0]
+    ]);
+  }
+
+  const budgetsSheet = spreadsheet.getSheetByName('budgets');
+  const year = new Date().getFullYear();
+  if (budgetsSheet.getLastRow() <= 1) {
+    budgetsSheet.getRange(2, 1, 6, 6).setValues([
+      [makeId_('BDG'), year, 'Belanja Barang', 'UNT-001', 42000000, 'Pengadaan stok perdagangan'],
+      [makeId_('BDG'), year, 'Operasional', 'UNT-001', 18000000, 'Operasional tahunan'],
+      [makeId_('BDG'), year, 'Pemeliharaan', 'UNT-002', 24000000, 'Pemeliharaan jaringan air'],
+      [makeId_('BDG'), year, 'Operasional', 'UNT-003', 15000000, 'Operasional alat'],
+      [makeId_('BDG'), year, 'Promosi', 'UNT-004', 12000000, 'Promosi destinasi'],
+      [makeId_('BDG'), year, 'Honorarium', 'UNT-004', 18000000, 'Petugas lapangan']
+    ]);
+  }
+
+  const txSheet = spreadsheet.getSheetByName('transactions');
+  if (txSheet.getLastRow() <= 1) seedTransactions_(txSheet);
+}
+
+function seedTransactions_(sheet) {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth();
+  const samples = [
+    [-1, 'TRX-001', 'Pemasukan', 'Penjualan', '1102', 'UNT-001', 'Penjualan kebutuhan pokok', 8750000, 'Transfer'],
+    [-2, 'TRX-002', 'Pengeluaran', 'Belanja Barang', '1102', 'UNT-001', 'Belanja stok perdagangan', 4250000, 'Transfer'],
+    [-4, 'TRX-003', 'Pemasukan', 'Pendapatan Layanan', '1101', 'UNT-002', 'Pembayaran layanan air bersih', 6200000, 'Tunai'],
+    [-6, 'TRX-004', 'Pengeluaran', 'Pemeliharaan', '1101', 'UNT-002', 'Perbaikan sambungan pipa', 1450000, 'Tunai'],
+    [-9, 'TRX-005', 'Pemasukan', 'Pendapatan Sewa', '1102', 'UNT-003', 'Sewa tenda dan kursi', 3750000, 'Transfer'],
+    [-12, 'TRX-006', 'Pengeluaran', 'Operasional', '1101', 'UNT-003', 'BBM dan transportasi alat', 875000, 'Tunai'],
+    [-16, 'TRX-007', 'Pemasukan', 'Pendapatan Wisata', '1103', 'UNT-004', 'Tiket dan jasa wisata', 4950000, 'QRIS'],
+    [-20, 'TRX-008', 'Pengeluaran', 'Promosi', '1103', 'UNT-004', 'Materi promosi digital', 1250000, 'Transfer'],
+    [-32, 'TRX-009', 'Pemasukan', 'Penjualan', '1102', 'UNT-001', 'Penjualan bulan sebelumnya', 7100000, 'Transfer'],
+    [-35, 'TRX-010', 'Pengeluaran', 'Belanja Barang', '1102', 'UNT-001', 'Belanja stok bulan sebelumnya', 3900000, 'Transfer'],
+    [-63, 'TRX-011', 'Pemasukan', 'Pendapatan Layanan', '1101', 'UNT-002', 'Pembayaran layanan air', 5400000, 'Tunai'],
+    [-67, 'TRX-012', 'Pengeluaran', 'Pemeliharaan', '1101', 'UNT-002', 'Penggantian meter air', 1100000, 'Tunai']
+  ];
+  const createdAt = new Date(year, month, 1).toISOString();
+  const rows = samples.map(function (sample, index) {
+    const date = new Date();
+    date.setDate(date.getDate() + sample[0]);
+    return [
+      makeId_('TRX'), normalizeDate_(date), sample[1], sample[2], sample[3], sample[4],
+      sample[5], sample[6], sample[7], sample[8], '', 'Posted', 'system@bumdes.local',
+      createdAt, createdAt
+    ];
+  });
+  sheet.getRange(2, 1, rows.length, APP.sheets.transactions.length).setValues(rows);
+}
+
+function rowsAsObjects_(sheet) {
+  if (!sheet || sheet.getLastRow() <= 1) return [];
+  const lastColumn = sheet.getLastColumn();
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getValues()[0];
+  const values = sheet.getRange(2, 1, sheet.getLastRow() - 1, lastColumn).getValues();
+  return values.filter(function (row) {
+    return row.some(function (cell) { return cell !== ''; });
+  }).map(function (row) {
+    return headers.reduce(function (obj, header, index) {
+      let value = row[index];
+      if (value instanceof Date) value = normalizeDate_(value);
+      obj[header] = value;
+      return obj;
+    }, {});
+  });
+}
+
+function validateTransaction_(payload) {
+  const allowedTypes = ['Pemasukan', 'Pengeluaran'];
+  if (allowedTypes.indexOf(cleanText_(payload.type)) < 0) throw new Error('Jenis transaksi tidak valid.');
+  if (!payload.date) throw new Error('Tanggal transaksi wajib diisi.');
+  if (!cleanText_(payload.category)) throw new Error('Kategori wajib dipilih.');
+  if (!cleanText_(payload.account)) throw new Error('Akun kas/bank wajib dipilih.');
+  if (!cleanText_(payload.unit)) throw new Error('Unit usaha wajib dipilih.');
+  if (!cleanText_(payload.description)) throw new Error('Uraian transaksi wajib diisi.');
+  if (!Number.isFinite(Number(payload.amount)) || Number(payload.amount) <= 0) {
+    throw new Error('Nominal transaksi harus lebih dari nol.');
+  }
+}
+
+function appendAudit_(spreadsheet, action, entity, entityId, detail) {
+  spreadsheet.getSheetByName('audit').appendRow([
+    new Date().toISOString(), action, entity, entityId, getUserEmail_(), cleanText_(detail)
+  ]);
+}
+
+function nextReference_(sheet, type) {
+  const prefix = type === 'Pemasukan' ? 'BM' : 'BK';
+  const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyyMMdd');
+  const sequence = Math.max(1, sheet.getLastRow());
+  return prefix + '-' + stamp + '-' + String(sequence).padStart(3, '0');
+}
+
+function normalizeDate_(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) throw new Error('Format tanggal tidak valid.');
+  return Utilities.formatDate(date, Session.getScriptTimeZone() || 'Asia/Jakarta', 'yyyy-MM-dd');
+}
+
+function makeId_(prefix) {
+  return prefix + '-' + Utilities.getUuid().split('-')[0].toUpperCase();
+}
+
+function getUserEmail_() {
+  return Session.getActiveUser().getEmail() || 'operator@bumdes.local';
+}
+
+function cleanText_(value) {
+  if (value === null || typeof value === 'undefined') return '';
+  let text = String(value).trim().slice(0, 1000);
+  if (/^[=+\-@]/.test(text)) text = "'" + text;
+  return text;
 }
